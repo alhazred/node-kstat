@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <sys/varargs.h>
+#include <sys/sysinfo.h>
 
 using namespace v8;
 using std::string;
@@ -20,23 +21,43 @@ public:
 protected:
 	static Persistent<FunctionTemplate> templ;
 
+	typedef struct {
+		int data_type;
+		uint32_t value_ui32;
+		uint64_t value_ui64;
+		string value_str;
+	} write_value_t;
+
 	KStatReader(string *module, string *classname,
 	    string *name, int instance);
 	Handle<Value> error(const char *fmt, ...);
 	Handle<Value> read(kstat_t *);
+	kstat_named_t* write(char *, write_value_t *);
 	int update();
 	~KStatReader();
 
 	static Handle<Value> New(const Arguments& args);
 	static Handle<Value> Read(const Arguments& args);
+	static Handle<Value> Write(const Arguments& args);
 	static Handle<Value> Update(const Arguments& args);
+	static void EIO_Write(eio_req *req);
+	static int EIO_AfterWrite(eio_req *req);
+	static Handle<Value> WriteAsync(const Arguments& args);
 
+	typedef struct {
+		KStatReader *k;
+		Persistent<Function> cb;
+		string name;
+		write_value_t val;
+		string error;
+	} write_baton_t;
 
 private:
 	static string *stringMember(Local<Value>, char *, char *);
 	static int64_t intMember(Local<Value>, char *, int64_t);
 	Handle<Object> data_named(kstat_t *);
 	Handle<Object> data_io(kstat_t *);
+	Handle<Object> data_raw(kstat_t *);
 
 	string *ksr_module;
 	string *ksr_class;
@@ -114,6 +135,8 @@ KStatReader::Initialize(Handle<Object> target)
 	templ->SetClassName(String::NewSymbol("Reader"));
 
 	NODE_SET_PROTOTYPE_METHOD(templ, "read", KStatReader::Read);
+	NODE_SET_PROTOTYPE_METHOD(templ, "write", KStatReader::Write);
+	NODE_SET_PROTOTYPE_METHOD(templ, "writeAsync", KStatReader::WriteAsync);
 
 	target->Set(String::NewSymbol("Reader"), templ->GetFunction());
 }
@@ -206,7 +229,9 @@ KStatReader::data_named(kstat_t *ksp)
 
 		switch (nm->data_type) {
 		case KSTAT_DATA_CHAR:
-			val = Number::New(nm->value.c[0]);
+			/* must protect string ending */
+			nm->value.c[15] = '\0';
+			val = String::New(nm->value.c);
 			break;
 
 		case KSTAT_DATA_INT32:
@@ -226,7 +251,9 @@ KStatReader::data_named(kstat_t *ksp)
 			break;
 
 		case KSTAT_DATA_STRING:
-			val = String::New(KSTAT_NAMED_STR_PTR(nm));
+			/* actually STR_PTR can be NULL and this is normal */
+			val = String::New(KSTAT_NAMED_STR_PTR(nm) ?
+			    KSTAT_NAMED_STR_PTR(nm) : "");
 			break;
 
 		default:
@@ -270,6 +297,64 @@ KStatReader::data_io(kstat_t *ksp)
 	return (data);
 }
 
+Handle<Object>
+KStatReader::data_raw(kstat_t *ksp)
+{
+	vminfo_t *vminfo;
+	cpu_stat_t *stat;
+	cpu_sysinfo_t *sysinfo;
+	static char buf[10];
+
+	Handle<Object> data = Object::New();
+
+	assert(ksp->ks_type == KSTAT_TYPE_RAW);
+
+	/* Get just some interesting data */
+	if (strncmp(ksp->ks_module, "unix", 4) == 0) {
+		if (strncmp(ksp->ks_name, "vminfo", 6) == 0) {
+			vminfo = (vminfo_t*) (ksp->ks_data);
+
+			data->Set(String::New("freemem"),
+			    Number::New(vminfo->freemem));
+			data->Set(String::New("swap_resv"),
+			    Number::New(vminfo->swap_resv));
+			data->Set(String::New("swap_alloc"),
+			    Number::New(vminfo->swap_alloc));
+			data->Set(String::New("swap_avail"),
+			    Number::New(vminfo->swap_avail));
+			data->Set(String::New("swap_free"),
+			    Number::New(vminfo->swap_free));
+			data->Set(String::New("updates"),
+			    Number::New(vminfo->updates));
+		}
+	}
+
+	if (strcmp(ksp->ks_module, "cpu_stat") == 0) {
+		(void) snprintf(buf, sizeof (buf), "cpu_stat%d",
+		    ksp->ks_instance);
+		if (strncmp(ksp->ks_name, buf, sizeof (buf)) == 0) {
+			stat = (cpu_stat_t *) (ksp->ks_data);
+			sysinfo = &stat->cpu_sysinfo;
+			data->Set(String::New("idle"),
+			    Number::New(sysinfo->cpu[CPU_IDLE]));
+			data->Set(String::New("user"), 
+			    Number::New(sysinfo->cpu[CPU_USER]));
+			data->Set(String::New("kernel"),
+			    Number::New(sysinfo->cpu[CPU_KERNEL]));
+			data->Set(String::New("wait"),
+			    Number::New(sysinfo->cpu[CPU_WAIT]));
+			data->Set(String::New("wait_io"),
+			    Number::New(sysinfo->cpu[W_IO]));
+			data->Set(String::New("wait_swap"),
+			    Number::New(sysinfo->cpu[W_SWAP]));
+			data->Set(String::New("wait_pio"),
+			    Number::New(sysinfo->cpu[W_PIO]));
+		}
+	}
+
+       return (data);
+}
+
 Handle<Value>
 KStatReader::read(kstat_t *ksp)
 {
@@ -302,6 +387,8 @@ KStatReader::read(kstat_t *ksp)
 		data = data_named(ksp);
 	} else if (ksp->ks_type == KSTAT_TYPE_IO) {
 		data = data_io(ksp);
+	} else if (ksp->ks_type == KSTAT_TYPE_RAW) {
+		data = data_raw(ksp);
 	} else {
 		return (rval);
 	}
@@ -315,7 +402,7 @@ Handle<Value>
 KStatReader::Read(const Arguments& args)
 {
 	KStatReader *k = ObjectWrap::Unwrap<KStatReader>(args.Holder());
-	Handle<Array> rval;
+	Handle<Object> rval = Object::New();
 	HandleScope scope;
 	int i;
 
@@ -334,8 +421,163 @@ KStatReader::Read(const Arguments& args)
 	return (rval);
 }
 
+kstat_named_t*
+KStatReader::write(char *name, write_value_t *val)
+{
+	kstat_t *ksp;
+	kstat_named_t *knp;
+
+	ksp = kstat_lookup(ksr_ctl, (char*)ksr_module->c_str(), ksr_instance,
+			   (char*)ksr_name->c_str());
+	if (!ksp)
+		return NULL;
+
+	if (kstat_read(ksr_ctl, ksp, NULL) == -1)
+		return NULL;
+
+	knp = (kstat_named_t *) kstat_data_lookup(ksp, name);
+	if (!knp)
+		return NULL;
+
+	if (val->data_type == KSTAT_DATA_UINT32) {
+		knp->value.ui32 = val->value_ui32;
+	} else if (val->data_type == KSTAT_DATA_UINT64) {
+		knp->value.ui64 = val->value_ui64;
+	} else if (val->data_type == KSTAT_DATA_STRING) {
+		KSTAT_NAMED_STR_PTR(knp) = (char*)KSTAT_NAMED_PTR(ksp) +
+		    ksp->ks_ndata * sizeof(kstat_named_t);
+		KSTAT_NAMED_STR_BUFLEN(knp) = val->value_str.length() + 1;
+		strcpy(KSTAT_NAMED_STR_PTR(knp),
+		    (char *)val->value_str.c_str());
+	}
+
+	if (kstat_write(ksr_ctl, ksp, NULL) == -1) {
+		return NULL;
+	}
+
+	return knp;
+}
+
+Handle<Value>
+KStatReader::Write(const Arguments& args)
+{
+	KStatReader *k = ObjectWrap::Unwrap<KStatReader>(args.Holder());
+	Handle<Object> rval = Object::New();
+	HandleScope scope;
+	kstat_named_t *knp;
+
+	if (args.Length() < 2 || !args[0]->IsString())
+		return (k->error("first argument must be string"));
+	String::Utf8Value name(args[0]->ToString());
+
+	if (args.Length() < 2)
+		return (k->error("second argument is not specified"));
+
+	write_value_t val;
+	Local<Value> value = args[1];
+	if (value->IsUint32()) {
+		val.data_type = KSTAT_DATA_UINT32;
+		val.value_ui32 = value->Uint32Value();
+	} else if (value->IsNumber()) {
+		val.data_type = KSTAT_DATA_UINT64;
+		val.value_ui64 = value->NumberValue();
+	} else if (value->IsString()) {
+		String::Utf8Value str(value->ToString());
+		val.data_type = KSTAT_DATA_STRING;
+		val.value_str = *str;
+	}
+	knp = k->write(*name, &val);
+	if (knp == NULL)
+		return (k->error("can't write kstat"));
+
+	return (rval);
+}
+
+void
+KStatReader::EIO_Write(eio_req *req)
+{
+	write_baton_t *baton = static_cast<write_baton_t *>(req->data);
+	kstat_named_t *knp;
+
+	knp = baton->k->write((char*)baton->name.c_str(), &baton->val);
+	if (knp == NULL)
+		baton->error = strerror(errno);
+}
+
+int
+KStatReader::EIO_AfterWrite(eio_req *req)
+{
+	HandleScope scope;
+	write_baton_t *baton = static_cast<write_baton_t *>(req->data);
+	ev_unref(EV_DEFAULT_UC);
+	baton->k->Unref();
+	Local<Value> argv[1];
+
+	if (!baton->error.empty()) {
+		Local<Value> err =
+		    Exception::Error(String::New(baton->error.c_str()));
+		argv[0] = err;
+	} else {
+		argv[0] = Local<Value>::New(Null());
+	}
+
+	TryCatch try_catch;
+	baton->cb->Call(Context::GetCurrent()->Global(), 1, argv);
+	if (try_catch.HasCaught()) {
+		node::FatalException(try_catch);
+	}
+
+	baton->cb.Dispose();
+	delete baton;
+	return 0;
+}
+
+Handle<Value>
+KStatReader::WriteAsync(const Arguments& args)
+{
+	KStatReader *k = ObjectWrap::Unwrap<KStatReader>(args.Holder());
+	Handle<Object> rval = Object::New();
+	HandleScope scope;
+
+	if (args.Length() < 3)
+		return (k->error("expecting 3 arguments"));
+
+	if (!args[0]->IsString())
+		return (k->error("first argument must be string"));
+	String::Utf8Value name(args[0]->ToString());
+	Local<Value> value = args[1];
+
+	if (!args[2]->IsFunction())
+		return (k->error("third argument is not function"));
+	Local<Function> cb = Local<Function>::Cast(args[2]);
+
+	write_baton_t *baton = new write_baton_t();
+	baton->k = k;
+	baton->cb = Persistent<Function>::New(cb);
+	baton->name = *name;
+
+	if (value->IsUint32()) {
+		baton->val.data_type = KSTAT_DATA_UINT32;
+		baton->val.value_ui32 = value->Uint32Value();
+	} else if (value->IsNumber()) {
+		baton->val.data_type = KSTAT_DATA_UINT64;
+		baton->val.value_ui64 = value->NumberValue();
+	} else if (value->IsString()) {
+		String::Utf8Value str(value->ToString());
+		baton->val.data_type = KSTAT_DATA_STRING;
+		baton->val.value_str = *str;
+	}
+
+	k->Ref();
+
+	eio_custom(EIO_Write, EIO_PRI_DEFAULT, EIO_AfterWrite, baton);
+	ev_ref(EV_DEFAULT_UC);
+
+	return (rval);
+}
+
 extern "C" void
-init (Handle<Object> target) 
+init (Handle<Object> target)
 {
 	KStatReader::Initialize(target);
 }
