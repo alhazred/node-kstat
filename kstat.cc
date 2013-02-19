@@ -312,7 +312,7 @@ KStatReader::data_raw(kstat_t *ksp)
 	/* Get just some interesting data */
 	if (strncmp(ksp->ks_module, "unix", 4) == 0) {
 		if (strncmp(ksp->ks_name, "vminfo", 6) == 0) {
-			vminfo = (vminfo_t*) (ksp->ks_data);
+			vminfo = (vminfo_t *) (ksp->ks_data);
 
 			data->Set(String::New("freemem"),
 			    Number::New(vminfo->freemem));
