@@ -329,7 +329,7 @@ KStatReader::data_raw(kstat_t *ksp)
 		}
 	}
 
-	if (strcmp(ksp->ks_module, "cpu_stat") == 0) {
+	if (strncmp(ksp->ks_module, "cpu_stat", 8) == 0) {
 		(void) snprintf(buf, sizeof (buf), "cpu_stat%d",
 		    ksp->ks_instance);
 		if (strncmp(ksp->ks_name, buf, sizeof (buf)) == 0) {
